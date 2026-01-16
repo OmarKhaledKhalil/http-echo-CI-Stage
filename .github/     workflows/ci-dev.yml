@@ -1,0 +1,104 @@
+name: CI -> DockerHub -> GitOps bump (dev)
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-bump-dev:
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_REPO: omarkhaledahmed/http-echo
+
+      # GitOps repo
+      GITOPS_OWNER: OmarKhaledKhalil
+      GITOPS_REPO: atos-gitops-project
+      GITOPS_BRANCH: main
+
+      # Your existing paths in GitOps repo
+      BUILD_CONTEXT: apps/http-echo
+      DEV_VALUES_FILE: apps/http-echo/values/dev.yaml
+
+      # Dockerfile location in CI repo
+      DOCKERFILE_IN_CI: Dockerfile
+
+    steps:
+      # 0) Checkout CI repo (contains workflow + Dockerfile)
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+
+      # 1) Checkout GitOps repo into ./gitops-repo (for build context + values update)
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}
+          ref: ${{ env.GITOPS_BRANCH }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops-repo
+
+      # 2) Compute immutable tag
+      - name: Compute image tag
+        id: tag
+        run: |
+          TAG="dev-${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      # 3) Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4) Build + push image
+      #    IMPORTANT: build context comes from GitOps repo, Dockerfile comes from CI repo
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: gitops-repo/${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_IN_CI }}
+          push: true
+          tags: ${{ env.IMAGE_REPO }}:${{ steps.tag.outputs.tag }}
+
+      # 5) Update dev.yaml -> image.tag
+      - name: Update GitOps dev values (image.tag)
+        run: |
+          set -euo pipefail
+          cd gitops-repo
+
+          FILE="${DEV_VALUES_FILE}"
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          echo "Updating ${FILE} -> image.tag: ${TAG}"
+
+          awk -v newtag="$TAG" '
+            BEGIN { in_image=0 }
+            /^image:[[:space:]]*$/ { in_image=1; print; next }
+            in_image && /^[[:space:]]*tag:[[:space:]]*/ { sub(/tag:.*/, "tag: " newtag); in_image=0; print; next }
+            in_image && /^[^[:space:]]/ { in_image=0 }
+            { print }
+          ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+
+          echo "Preview:"
+          cat "$FILE"
+
+      # 6) Commit + push to GitOps repo (triggers Argo CD)
+      - name: Commit & push GitOps change
+        run: |
+          set -euo pipefail
+          cd gitops-repo
+
+          git config user.name  "Omar Khaled"
+          git config user.email "Omar_Khaled@gmail.com"
+
+          git add "${DEV_VALUES_FILE}"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ci(dev): bump http-echo image.tag to ${{ steps.tag.outputs.tag }} [skip ci]"
+          git push origin HEAD:${GITOPS_BRANCH}
